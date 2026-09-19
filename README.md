@@ -5,7 +5,9 @@
 软删除取消、**两条预约时段原子交换**、单事务冲突检测、
 **可校验的 SHA-256 哈希链变更历史**、
 **预约临时保留 / 确认**、**预约候补队列**、
-**预约时序依赖**：有向最小间隔约束，改期/取消时同事务重验）。
+**预约时序依赖**：有向最小间隔约束，改期/取消时同事务重验）、
+**会议室批量分配**（会议室 upsert/查询；整批全局求解、
+确定性最优解、整批有解才在单事务内持久化）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -39,11 +41,12 @@ app/
   holds.py         # 临时保留核心：TTL 占位、事务内惰性过期、确认转正式预约
   waitlist.py      # 候补核心：可预约直订/否则入队、request_id 幂等、取消事务内 FIFO 扫描晋升
   dependencies.py  # 时序依赖核心：有向最小间隔约束建边（自环/成环拒绝、幂等）、改期/取消时可达依赖整图重验
+  room_assignments.py  # 会议室批量分配核心：会议室 upsert/查询、整批全局求解（确定性最优解）、同事务持久化/释放
   audit.py         # 审计事件：canonical JSON、SHA-256 哈希链追加与整链重验
   db.py            # SQLite 连接管理、建表与无损迁移（补列 / 补 baseline 事件）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、时段交换、临时保留、候补 FIFO 晋升、时序依赖、哈希链/篡改/迁移）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、时段交换、临时保留、候补 FIFO 晋升、时序依赖、会议室批量分配、哈希链/篡改/迁移）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -83,6 +86,9 @@ docker compose up --build
 `reservation_waitlist_participants` 两张新表同样以
 `CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
 升级到带**时序依赖**的版本后，`reservation_dependencies` 表同样以
+`CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
+升级到带**会议室批量分配**的版本后，`meeting_rooms`、
+`room_assignment_batches` 与 `room_assignments` 三张新表同样以
 `CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
@@ -977,6 +983,177 @@ for ev in history["events"]:
 不会伪造出过去的 `created`/`rescheduled`/`canceled` 事件；迁移后新的成功操作
 正常追加为 seq=2、3……并与 baseline 的哈希衔接。
 
+### `PUT /api/v1/meeting-rooms/{room_id}`
+
+会议室 **upsert**：`room_id` 不存在则创建（`201`），存在则整体替换容量与
+设备标签（`200`）。请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `capacity` | 整数 ≥ 1 | 会议室容量（座位数） |
+| `equipment` | 字符串数组 | 设备标签；**去重并按字典序排序**后存储，可空 |
+
+语义：
+
+- 整个 upsert 在单个 `BEGIN IMMEDIATE` 事务内完成；更新时 `created_at`
+  保持不变、`updated_at` 刷新为本次写入时刻；
+- upsert **不回溯校验既有分配**：已落库的分配是历史事实，仍按预约时段
+  占用该房间（后续新批次的求解使用房间的**最新**容量与设备）。
+
+```bash
+curl -s -X PUT http://localhost:8000/api/v1/meeting-rooms/room-a \
+  -H 'Content-Type: application/json' \
+  -d '{"capacity": 6, "equipment": ["whiteboard", "tv", "tv"]}'
+```
+
+响应（`201` 创建 / `200` 更新，设备已去重排序）：
+
+```json
+{
+  "room_id": "room-a",
+  "capacity": 6,
+  "equipment": ["tv", "whiteboard"],
+  "created_at": "2026-09-19T08:30:41.174548Z",
+  "updated_at": "2026-09-19T08:30:41.174548Z"
+}
+```
+
+错误：`422`（`capacity < 1`、设备标签为空串等）。
+
+### `GET /api/v1/meeting-rooms`
+
+列出全部会议室（按 `room_id` 字典序）。可选查询参数：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `min_capacity` | 整数 ≥ 1 | 只返回容量不小于该值的会议室 |
+| `equipment` | 逗号分隔字符串 | 只返回**全部具备**这些标签的会议室 |
+
+```bash
+curl -s 'http://localhost:8000/api/v1/meeting-rooms?min_capacity=4&equipment=tv,whiteboard'
+```
+
+### `GET /api/v1/meeting-rooms/{room_id}`
+
+按 `room_id` 查询单个会议室；不存在 → `404`。
+
+### `POST /api/v1/room-assignments`
+
+**会议室批量分配**：提交一组 `active` 预约及各自所需容量/设备，
+结合已有分配与预约时段做**全局求解**；**仅当整批都有解时才持久化**。
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `batch_id` | 非空字符串（≤200） | 客户端幂等键 |
+| `items[].reservation_id` | 正整数 | 待分配的 `active` 预约 ID（批内不得重复） |
+| `items[].required_capacity` | 整数 ≥ 1 | 所需容量；房间容量须不小于该值 |
+| `items[].required_equipment` | 字符串数组 | 必备设备标签（房间须全部具备），可空 |
+
+语义（整个“幂等判定 + 校验 + 求解 + 持久化”在单个 `BEGIN IMMEDIATE`
+事务内完成，并发批次被串行化）：
+
+- **约束**：同一房间不得分给时间**半开区间重叠**的预约（首尾相接不冲突）；
+  房间容量须不小于所需容量、设备须全覆盖；**已有分配**（既有批次落库的
+  房间占用，按各自预约时段计）与本批成员共同参与求解——本批成员的旧分配
+  将被本次求解**替换**，不构成障碍；
+- **确定性**：在所有完备解中，先取**总空余座位最少**
+  （Σ 房间容量 − 所需容量），再按（预约 id 升序、`room_id` 字典序）
+  取字典序最小的解——同一输入永远得到同一答案；
+- **整批有解才持久化**（`201`）：写入批次与全部分配；任一环节失败
+  整体回滚，不留下部分写入；
+- **整批无解**（`409`）：响应列出 `unassignable`——“可分配数最多、
+  并列时总空余最少、再按同一向量字典序最小（未分配排在任何 `room_id`
+  之后）”的确定性最优部分解中未获分配的预约 id（升序）；
+  **已有分配保持不变**，批次不落库；
+- **幂等**：相同 `batch_id` + 相同规范化内容（按预约 id 排序的
+  （预约、所需容量、去重设备）列表）重试 → `200` 返回该批次**当前**分配；
+  同键内容不同 → `409`（`existing_batch_id`）；
+- **校验**：任一预约不存在 → `404`；任一预约已取消 → `409`
+  （`current_version`）；批内预约重复、空批次、非法容量 → `422`。
+
+请求示例（两条同时段预约整批分配）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/room-assignments \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "batch-001",
+    "items": [
+      {"reservation_id": 1, "required_capacity": 4, "required_equipment": ["tv"]},
+      {"reservation_id": 2, "required_capacity": 2}
+    ]
+  }'
+```
+
+成功响应（`201`，幂等重放为 `200`；按预约 id 升序）：
+
+```json
+{
+  "batch_id": "batch-001",
+  "total_spare_seats": 3,
+  "assignments": [
+    {
+      "reservation_id": 1,
+      "room_id": "room-a",
+      "start_utc": "2026-03-09T13:00:00Z",
+      "end_utc": "2026-03-09T14:00:00Z",
+      "required_capacity": 4,
+      "room_capacity": 6,
+      "spare_seats": 2
+    },
+    {
+      "reservation_id": 2,
+      "room_id": "room-b",
+      "start_utc": "2026-03-09T13:00:00Z",
+      "end_utc": "2026-03-09T14:00:00Z",
+      "required_capacity": 2,
+      "room_capacity": 3,
+      "spare_seats": 1
+    }
+  ],
+  "created_at": "2026-09-19T09:12:03.445566Z"
+}
+```
+
+整批无解（`409`，已有分配不变）：
+
+```json
+{
+  "detail": "room assignment batch has no feasible solution; unassignable reservations: #2",
+  "unassignable": [2]
+}
+```
+
+同 `batch_id` 内容不同（`409`）：
+
+```json
+{
+  "detail": "batch_id is already used by room assignment batch 'batch-001' with different content",
+  "existing_batch_id": "batch-001"
+}
+```
+
+**与预约生命周期的联动**：预约**改期 / 取消 / 时段交换**会在各自事务内
+**释放**其会议室分配（分配与求解时的时段绑定，时段变更即失效），
+因此已有分配之间永远不会出现时间重叠；需要时重新提交批次即可再次分配。
+
+### `GET /api/v1/room-assignments`
+
+列出**当前**全部分配（按预约 id、`room_id` 升序）。可选查询参数：
+`room_id`（按会议室过滤）、`reservation_id`（按预约过滤）。
+每条记录含 `batch_id`、预约时段、所需容量、房间当前容量与空余座位。
+
+```bash
+curl -s 'http://localhost:8000/api/v1/room-assignments?room_id=room-a'
+```
+
+### `GET /api/v1/room-assignments/{batch_id}`
+
+按 `batch_id` 查询批次及其**当前**分配（结构同批量分配响应）；
+批次不存在 → `404`。批次成员的分配被后续批次替换、或因预约
+改期/取消/交换释放后，本接口反映最新状态（可能少于求解时的条数）。
+
 ## 测试覆盖要点
 
 - **春季跳变**：不存在的钟面时刻报错；跨越跳变间隙的窗口 UTC 时长缩短（柏林 2026-03-29 00:00–04:00 实际只有 3 小时）。
@@ -1043,6 +1220,18 @@ for ev in history["events"]:
   两端取消均 409 且保持 active、修复后可取消、已取消前驱仍按存储时段
   约束后继、依赖可指向已取消预约；并发建边同键只新建一次；
   旧版库初始化无损新建依赖表且既有数据不动。
+- **会议室批量分配（room assignments）**：会议室 upsert 创建 201 /
+  更新 200（`created_at` 保留）、设备标签去重排序、容量/标签校验 422、
+  单个查询 404、列表按 `room_id` 排序并支持最小容量与必备设备过滤；
+  批量求解**确定性**（总空余座位最少优先、并列按（预约 id, room_id）
+  字典序，含多预约向量并列）、已有分配按预约时段占用房间、
+  半开区间相邻不冲突、容量/设备过滤、批内互斥、整批无解 409 且
+  `unassignable` 为确定性最优部分解的未分配项（已有分配与批次均不变）、
+  `batch_id` 幂等重放 200 / 同键异内容 409、预约不存在 404 /
+  已取消 409、空批次/重复预约/非法容量 422、重批同事务替换成员旧分配、
+  列表/过滤/按批次查询（未知批次 404）、改期/取消/交换同事务释放分配
+  （失败改期回滚后分配不变）、并发批次竞争同一房间恰一个赢家、
+  并发同键重试只建一个批次；旧版库初始化无损新建三张新表且既有数据不动。
 
 ```bash
 pytest -q

@@ -9,13 +9,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Path, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import db as db_module
 from . import dependencies as dependency_core
 from . import holds as hold_core
 from . import reservations as reservation_core
+from . import room_assignments as room_assignment_core
 from . import scheduling
 from . import waitlist as waitlist_core
 from .audit import CANON_FMT as _AUDIT_CANON_FMT, ChainVerificationError
@@ -28,6 +29,12 @@ from .holds import (
     HoldExpiredError,
     HoldKeyConflictError,
     HoldNotFoundError,
+)
+from .room_assignments import (
+    BatchContentConflictError,
+    BatchNotFoundError,
+    BatchUnsolvableError,
+    RoomNotFoundError,
 )
 from .waitlist import (
     WaitlistContentConflictError,
@@ -46,6 +53,8 @@ from .schemas import (
     AggregationResponse,
     HistoryEventOut,
     LocalTimeOut,
+    MeetingRoomIn,
+    MeetingRoomOut,
     ParticipantIn,
     ReservationDependencyIn,
     ReservationDependencyOut,
@@ -60,6 +69,10 @@ from .schemas import (
     ReservationSwapOut,
     ReservationWaitlistIn,
     ReservationWaitlistOut,
+    RoomAssignmentBatchIn,
+    RoomAssignmentBatchOut,
+    RoomAssignmentOut,
+    RoomAssignmentRecordOut,
     SegmentOut,
     WEEKDAY_NAMES,
 )
@@ -99,8 +112,15 @@ app = FastAPI(
         "dependency_request_id 幂等）；改期或取消预约时在同一 BEGIN IMMEDIATE "
         "事务内重验其全部可达依赖，违反约束返回 409 并列出完整链路，"
         "不写入部分变更。"
+        "另提供会议室批量分配（room assignments）：会议室以唯一 room_id "
+        "upsert/查询（容量 + 去重设备标签）；提交一组 active 预约及各自所需"
+        "容量/设备后，在单个 BEGIN IMMEDIATE 事务内结合已有分配与预约时段"
+        "全局求解——同一房间不得分给时间重叠的预约，仅当整批都有解才持久化，"
+        "无解返回 409 并列出无法分配的预约、已有分配不变；结果确定性"
+        "（总空余座位最少优先，再按预约 id、room_id 字典序取解）；"
+        "预约改期/取消/交换会在各自事务内释放其会议室分配。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -231,6 +251,37 @@ async def version_conflict_handler(request, exc: VersionConflictError) -> JSONRe
             "detail": str(exc),
             "current_version": exc.current_version,
         },
+    )
+
+
+@app.exception_handler(RoomNotFoundError)
+async def room_not_found_handler(request, exc: RoomNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(BatchNotFoundError)
+async def batch_not_found_handler(request, exc: BatchNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(BatchContentConflictError)
+async def batch_content_conflict_handler(
+    request, exc: BatchContentConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "existing_batch_id": exc.batch_id},
+    )
+
+
+@app.exception_handler(BatchUnsolvableError)
+async def batch_unsolvable_handler(
+    request, exc: BatchUnsolvableError
+) -> JSONResponse:
+    # 整批无解：列出确定性最优部分解中未获分配的预约，已有分配不变
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "unassignable": exc.unassignable},
     )
 
 
@@ -711,3 +762,163 @@ def create_reservation_dependency(
         # 幂等重放：返回原依赖
         response.status_code = 200
     return _dependency_to_out(dependency)
+
+
+# ---------------------------------------------------- meeting rooms
+
+
+def _room_to_out(r: room_assignment_core.MeetingRoom) -> MeetingRoomOut:
+    return MeetingRoomOut(
+        room_id=r.room_id,
+        capacity=r.capacity,
+        equipment=list(r.equipment),
+        created_at=_iso_z(r.created_at),
+        updated_at=_iso_z(r.updated_at),
+    )
+
+
+@app.put("/api/v1/meeting-rooms/{room_id}", response_model=MeetingRoomOut)
+def upsert_meeting_room(
+    req: MeetingRoomIn,
+    response: Response,
+    room_id: str = Path(min_length=1, max_length=200),
+) -> MeetingRoomOut:
+    """会议室 upsert：不存在则创建（``201``），存在则整体替换容量与
+    设备标签（``200``，``created_at`` 不变、``updated_at`` 刷新）。
+
+    设备标签**去重并按字典序排序**后存储。upsert 不回溯校验既有分配：
+    已落库的分配仍按预约时段占用该房间。
+    """
+    room, created = room_assignment_core.upsert_room(
+        room_id=room_id, capacity=req.capacity, equipment=req.equipment)
+    response.status_code = 201 if created else 200
+    return _room_to_out(room)
+
+
+@app.get("/api/v1/meeting-rooms", response_model=list[MeetingRoomOut])
+def list_meeting_rooms(
+    min_capacity: int | None = Query(
+        default=None, ge=1,
+        description="只返回容量不小于该值的会议室",
+    ),
+    equipment: str | None = Query(
+        default=None,
+        description="逗号分隔的设备标签；只返回全部具备的会议室",
+    ),
+) -> list[MeetingRoomOut]:
+    """列出会议室（按 ``room_id`` 字典序），可按最小容量与必备设备过滤。"""
+    tags = tuple(t.strip() for t in (equipment or "").split(",") if t.strip())
+    rooms = room_assignment_core.list_rooms(
+        min_capacity=min_capacity, required_equipment=tags)
+    return [_room_to_out(r) for r in rooms]
+
+
+@app.get("/api/v1/meeting-rooms/{room_id}", response_model=MeetingRoomOut)
+def get_meeting_room(room_id: str) -> MeetingRoomOut:
+    """按 ``room_id`` 查询会议室；不存在 → ``404``。"""
+    return _room_to_out(room_assignment_core.get_room(room_id))
+
+
+# ---------------------------------------------------- room assignments
+
+
+def _assignment_record_to_out(
+    a: room_assignment_core.AssignmentRecord,
+) -> RoomAssignmentRecordOut:
+    return RoomAssignmentRecordOut(
+        batch_id=a.batch_id,
+        reservation_id=a.reservation_id,
+        room_id=a.room_id,
+        start_utc=_iso_z(a.start_utc),
+        end_utc=_iso_z(a.end_utc),
+        required_capacity=a.required_capacity,
+        room_capacity=a.room_capacity,
+        spare_seats=a.spare_seats,
+        created_at=_iso_z(a.created_at),
+    )
+
+
+def _batch_to_out(result: room_assignment_core.BatchResult) -> RoomAssignmentBatchOut:
+    return RoomAssignmentBatchOut(
+        batch_id=result.batch_id,
+        total_spare_seats=result.total_spare_seats,
+        assignments=[
+            RoomAssignmentOut(
+                reservation_id=a.reservation_id,
+                room_id=a.room_id,
+                start_utc=_iso_z(a.start_utc),
+                end_utc=_iso_z(a.end_utc),
+                required_capacity=a.required_capacity,
+                room_capacity=a.room_capacity,
+                spare_seats=a.spare_seats,
+            )
+            for a in result.assignments
+        ],
+        created_at=_iso_z(result.created_at),
+    )
+
+
+@app.post(
+    "/api/v1/room-assignments",
+    response_model=RoomAssignmentBatchOut,
+    status_code=201,
+)
+def create_room_assignment_batch(
+    req: RoomAssignmentBatchIn, response: Response
+) -> RoomAssignmentBatchOut:
+    """会议室批量分配：整批全局求解，**仅当整批都有解才持久化**。
+
+    整个“幂等判定 + 校验 + 求解 + 持久化”在单个 ``BEGIN IMMEDIATE``
+    事务内完成：
+
+    - 任一预约不存在 → ``404``；任一预约已取消 → ``409``；
+    - 结合**已有分配**（本批成员的旧分配将被替换，不构成障碍）与预约
+      时段全局求解：同一房间不得分给时间**半开区间重叠**的预约
+      （首尾相接不冲突），房间容量须不小于所需容量、设备须全覆盖；
+    - **整批无解** → ``409`` + ``unassignable``（确定性最优部分解中
+      未获分配的预约 id，升序），整体回滚、**已有分配不变**；
+    - 结果**确定性**：总空余座位最少优先，再按（预约 id、room_id）
+      字典序取解——同一输入永远得到同一答案；
+    - 相同 ``batch_id`` + 相同规范化内容重试 → ``200`` 返回该批次
+      当前分配；同键内容不同 → ``409``（``existing_batch_id``）。
+    """
+    result, created = room_assignment_core.assign_batch(
+        batch_id=req.batch_id,
+        items=[
+            (item.reservation_id, item.required_capacity, item.required_equipment)
+            for item in req.items
+        ],
+    )
+    if not created:
+        # 幂等重放：返回该批次当前分配
+        response.status_code = 200
+    return _batch_to_out(result)
+
+
+@app.get(
+    "/api/v1/room-assignments",
+    response_model=list[RoomAssignmentRecordOut],
+)
+def list_room_assignments(
+    room_id: str | None = Query(default=None, description="按会议室过滤"),
+    reservation_id: int | None = Query(
+        default=None, ge=1, description="按预约过滤",
+    ),
+) -> list[RoomAssignmentRecordOut]:
+    """列出当前全部分配（按预约 id、room_id 升序），可按房间/预约过滤。"""
+    records = room_assignment_core.list_assignments(
+        room_id=room_id, reservation_id=reservation_id)
+    return [_assignment_record_to_out(a) for a in records]
+
+
+@app.get(
+    "/api/v1/room-assignments/{batch_id}",
+    response_model=RoomAssignmentBatchOut,
+)
+def get_room_assignment_batch(batch_id: str) -> RoomAssignmentBatchOut:
+    """按 ``batch_id`` 查询批次及其**当前**分配；不存在 → ``404``。
+
+    批次成员的分配被后续批次替换、或因预约改期/取消/交换释放后，
+    本接口反映最新状态（可能少于求解时的条数）。
+    """
+    return _batch_to_out(room_assignment_core.get_batch(batch_id))

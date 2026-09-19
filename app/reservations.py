@@ -21,6 +21,8 @@
 - 改期与取消还会在同一事务内重验该预约的**全部可达时序依赖**
   （:mod:`app.dependencies`：``predecessor.end + gap <= successor.start``）：
   任一约束不满足则整体回滚并返回 409 + 完整链路，不写入部分变更。
+- 改期/取消/时段交换还会在同一事务内释放该预约的**会议室分配**
+  （:mod:`app.room_assignments`：分配与求解时的时段绑定，时段变更即失效）。
 """
 
 from __future__ import annotations
@@ -438,6 +440,12 @@ def reschedule_reservation(
             dependency_core.validate_reachable_dependencies(
                 conn, reservation_id, new_start_s=start_s, new_end_s=end_s)
 
+            # 会议室分配与求解时的时段绑定：改期即失效，同事务释放
+            # （惰性导入避免与 room_assignments 模块循环导入）
+            from . import room_assignments as room_assignment_core
+            room_assignment_core.release_assignments_for_reservations(
+                conn, (reservation_id,))
+
             conn.execute(
                 "UPDATE reservations"
                 " SET start_utc = ?, end_utc = ?, participants_key = ?,"
@@ -586,6 +594,11 @@ def swap_reservations(
                 conn, participants_b, new_b_start_s, new_b_end_s, now_s))
             if conflicts:
                 raise ReservationConflictError(conflicts)
+
+            # 交换双方时段都将改变：同事务释放双方的会议室分配
+            from . import room_assignments as room_assignment_core
+            room_assignment_core.release_assignments_for_reservations(
+                conn, (first_id, second_id))
 
             # 主表行：仅互换起止时刻并各推进版本；
             # request_id / participants_key / created_at 保持不变。
@@ -753,6 +766,10 @@ def cancel_reservation(
                 "DELETE FROM reservation_participants WHERE reservation_id = ?",
                 (reservation_id,),
             )
+            # 取消同时释放会议室分配（同事务），房间立即可被新批次使用
+            from . import room_assignments as room_assignment_core
+            room_assignment_core.release_assignments_for_reservations(
+                conn, (reservation_id,))
             # 同事务追加 canceled 审计事件：快照记录取消后的终态
             # （status=canceled、version+1、canceled_at）
             snapshot = audit.build_snapshot(

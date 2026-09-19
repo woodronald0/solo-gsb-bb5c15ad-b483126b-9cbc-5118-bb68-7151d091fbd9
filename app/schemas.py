@@ -391,3 +391,121 @@ class ReservationHistoryOut(BaseModel):
     events: list[HistoryEventOut] = Field(
         description="按 seq 升序的审计事件；返回前服务端已重验整条哈希链"
     )
+
+
+class MeetingRoomIn(BaseModel):
+    """会议室 upsert 请求：容量 + 设备标签（去重排序后存储）。"""
+
+    capacity: int = Field(
+        ge=1,
+        description="会议室容量（座位数）",
+        examples=[6],
+    )
+    equipment: list[str] = Field(
+        default_factory=list,
+        description="设备标签；去重并按字典序排序后存储",
+        examples=[["tv", "whiteboard"]],
+    )
+
+    @field_validator("equipment")
+    @classmethod
+    def _validate_equipment(cls, v: list[str]) -> list[str]:
+        if any(not t.strip() for t in v):
+            raise ValueError("equipment tags must be non-empty")
+        return v
+
+
+class MeetingRoomOut(BaseModel):
+    room_id: str
+    capacity: int
+    equipment: list[str] = Field(description="设备标签，去重后按字典序排列")
+    created_at: str
+    updated_at: str = Field(description="最近一次 upsert 时刻（UTC ISO 8601）")
+
+
+class RoomAssignmentItemIn(BaseModel):
+    """批量分配的一项：一条 active 预约及其所需容量/设备。"""
+
+    reservation_id: int = Field(
+        ge=1,
+        description="待分配的 active 预约 ID",
+        examples=[1],
+    )
+    required_capacity: int = Field(
+        ge=1,
+        description="所需容量（座位数）；房间容量须不小于该值",
+        examples=[4],
+    )
+    required_equipment: list[str] = Field(
+        default_factory=list,
+        description="必备设备标签（房间须全部具备）；去重排序后参与求解与幂等比较",
+        examples=[["tv"]],
+    )
+
+    @field_validator("required_equipment")
+    @classmethod
+    def _validate_required_equipment(cls, v: list[str]) -> list[str]:
+        if any(not t.strip() for t in v):
+            raise ValueError("equipment tags must be non-empty")
+        return v
+
+
+class RoomAssignmentBatchIn(BaseModel):
+    """会议室批量分配请求：一组 active 预约 + 各自所需容量/设备。"""
+
+    batch_id: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "客户端幂等键：相同键 + 相同规范化内容重试返回该批次当前分配；"
+            "键相同但内容不同返回 409"
+        ),
+        examples=["batch-001"],
+    )
+    items: list[RoomAssignmentItemIn] = Field(
+        min_length=1,
+        description="待分配的预约及各自所需容量/设备；reservation_id 不得重复",
+    )
+
+    @model_validator(mode="after")
+    def _validate_unique_reservations(self) -> "RoomAssignmentBatchIn":
+        ids = [it.reservation_id for it in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("reservation ids in items must be unique")
+        return self
+
+
+class RoomAssignmentOut(BaseModel):
+    reservation_id: int
+    room_id: str
+    start_utc: str = Field(description="预约 UTC 开始时间 ISO 8601", examples=["2026-03-09T13:00:00Z"])
+    end_utc: str
+    required_capacity: int
+    room_capacity: int
+    spare_seats: int = Field(
+        description="该分配的空余座位数（room_capacity - required_capacity）",
+    )
+
+
+class RoomAssignmentBatchOut(BaseModel):
+    batch_id: str
+    total_spare_seats: int = Field(
+        description="整批总空余座位（确定性求解的第一优化目标）",
+    )
+    assignments: list[RoomAssignmentOut] = Field(
+        description="按预约 id 升序的分配结果",
+    )
+    created_at: str
+
+
+class RoomAssignmentRecordOut(BaseModel):
+    """一条当前有效的会议室分配（列表查询输出）。"""
+
+    batch_id: str
+    reservation_id: int
+    room_id: str
+    start_utc: str = Field(description="预约 UTC 开始时间 ISO 8601")
+    end_utc: str
+    required_capacity: int
+    room_capacity: int
+    spare_seats: int
+    created_at: str
