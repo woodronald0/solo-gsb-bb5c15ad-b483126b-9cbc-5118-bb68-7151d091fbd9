@@ -391,3 +391,155 @@ class ReservationHistoryOut(BaseModel):
     events: list[HistoryEventOut] = Field(
         description="按 seq 升序的审计事件；返回前服务端已重验整条哈希链"
     )
+
+
+# --------------------------------------------------------- meeting rooms
+
+
+class MeetingRoomIn(BaseModel):
+    """会议室 upsert 请求：唯一 room_id + 容量 + 设备标签。"""
+
+    room_id: str = Field(
+        min_length=1, max_length=200,
+        description="会议室唯一标识；已存在则更新（upsert），否则新建",
+        examples=["room-a"],
+    )
+    capacity: int = Field(
+        ge=1,
+        description="房间容量（座位数），分配时须满足预约的 required_capacity",
+        examples=[10],
+    )
+    equipment_tags: list[str] = Field(
+        default=[],
+        description="设备标签列表；去重后按字典序排序存储，区分大小写",
+        examples=[["projector", "whiteboard"]],
+    )
+
+    @field_validator("equipment_tags")
+    @classmethod
+    def _validate_tags(cls, v: list[str]) -> list[str]:
+        if any(not tag.strip() for tag in v):
+            raise ValueError("equipment tags must be non-empty")
+        return v
+
+
+class MeetingRoomOut(BaseModel):
+    room_id: str
+    capacity: int = Field(description="房间容量（座位数）", examples=[10])
+    equipment_tags: list[str] = Field(
+        description="去重后按字典序排列的设备标签",
+        examples=[["projector", "whiteboard"]],
+    )
+    created_at: str
+    updated_at: str = Field(
+        description="最近一次 upsert 的时刻（UTC ISO 8601）；首次创建等于 created_at",
+    )
+
+
+class MeetingRoomListOut(BaseModel):
+    rooms: list[MeetingRoomOut] = Field(
+        description="全部会议室，按 room_id 字典序升序"
+    )
+
+
+class RoomAssignmentRequestIn(BaseModel):
+    """单条预约的房间分配需求。"""
+
+    reservation_id: int = Field(
+        ge=1,
+        description="需要分配会议室的 active 预约 ID",
+        examples=[1],
+    )
+    required_capacity: int = Field(
+        ge=1,
+        description="所需容量（座位数）；仅容量 >= 该值的房间可被分配",
+        examples=[6],
+    )
+    required_equipment: list[str] = Field(
+        default=[],
+        description="所需设备标签；房间设备须包含全部要求标签（去重排序后比较）",
+        examples=[["projector"]],
+    )
+
+    @field_validator("required_equipment")
+    @classmethod
+    def _validate_tags(cls, v: list[str]) -> list[str]:
+        if any(not tag.strip() for tag in v):
+            raise ValueError("required equipment tags must be non-empty")
+        return v
+
+
+class RoomBatchAssignmentIn(BaseModel):
+    """会议室批量分配请求：一组预约需求做全局求解，整批可解才持久化。"""
+
+    reservations: list[RoomAssignmentRequestIn] = Field(
+        min_length=1,
+        description=(
+            "待分配预约需求列表（至少 1 条）；reservation_id 不得重复。"
+            "结合本批未涉及的既有分配与各预约时段全局求解，同一房间不得"
+            "分给时间重叠的预约；仅整批有解时才持久化"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_unique(self) -> "RoomBatchAssignmentIn":
+        ids = [item.reservation_id for item in self.reservations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("reservation_id must be unique within the batch")
+        return self
+
+
+class RoomAssignmentOut(BaseModel):
+    """单条分配结果。"""
+
+    reservation_id: int
+    room_id: str
+    required_capacity: int = Field(
+        description="该预约在本批请求中声明的所需容量"
+    )
+    required_equipment: list[str] = Field(
+        description="该预约在本批请求中声明的所需设备（去重字典序）"
+    )
+    start_utc: str = Field(description="预约 UTC 开始时间 ISO 8601")
+    end_utc: str = Field(description="预约 UTC 结束时间 ISO 8601")
+    spare_seats: int = Field(
+        description="空余座位 = room.capacity - required_capacity（非负）"
+    )
+
+
+class RoomBatchAssignmentOut(BaseModel):
+    """批量分配结果：整批成功时返回确定性最优解。"""
+
+    assignments: list[RoomAssignmentOut] = Field(
+        description="分配结果，按 reservation_id 字典序（升序）排列"
+    )
+    total_spare_seats: int = Field(
+        description=(
+            "总空余座位（sum(room.capacity - required_capacity)）；"
+            "在全部可行解中取最小值，并列时按预约 id、room_id 字典序取解"
+        ),
+    )
+
+
+class RoomAssignmentQueryOut(BaseModel):
+    """分配查询结果项：分配行 + 预约窗口与房间快照。"""
+
+    assignment_id: int
+    reservation_id: int
+    room_id: str
+    start_utc: str = Field(description="预约 UTC 开始时间 ISO 8601")
+    end_utc: str
+    status: Literal["active", "canceled"] = Field(
+        description="预约当前状态；已取消预约的历史分配默认仍可查到",
+    )
+    room_capacity: int
+    room_equipment_tags: list[str] = Field(
+        description="房间当前设备标签（去重字典序）"
+    )
+    assigned_at: str = Field(description="分配写入时刻（UTC ISO 8601）")
+
+
+class RoomAssignmentListOut(BaseModel):
+    assignments: list[RoomAssignmentQueryOut] = Field(
+        description="分配记录，按 reservation_id 升序"
+    )

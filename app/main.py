@@ -9,13 +9,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import db as db_module
 from . import dependencies as dependency_core
 from . import holds as hold_core
 from . import reservations as reservation_core
+from . import rooms as room_core
 from . import scheduling
 from . import waitlist as waitlist_core
 from .audit import CANON_FMT as _AUDIT_CANON_FMT, ChainVerificationError
@@ -40,12 +41,19 @@ from .reservations import (
     ReservationNotFoundError,
     VersionConflictError,
 )
+from .rooms import (
+    BatchAssignmentInfeasibleError,
+    RoomNotFoundError,
+)
 from .scheduling import SchedulingError
 from .schemas import (
     AggregationRequest,
     AggregationResponse,
     HistoryEventOut,
     LocalTimeOut,
+    MeetingRoomIn,
+    MeetingRoomListOut,
+    MeetingRoomOut,
     ParticipantIn,
     ReservationDependencyIn,
     ReservationDependencyOut,
@@ -60,6 +68,11 @@ from .schemas import (
     ReservationSwapOut,
     ReservationWaitlistIn,
     ReservationWaitlistOut,
+    RoomAssignmentListOut,
+    RoomAssignmentOut,
+    RoomAssignmentQueryOut,
+    RoomBatchAssignmentIn,
+    RoomBatchAssignmentOut,
     SegmentOut,
     WEEKDAY_NAMES,
 )
@@ -99,8 +112,14 @@ app = FastAPI(
         "dependency_request_id 幂等）；改期或取消预约时在同一 BEGIN IMMEDIATE "
         "事务内重验其全部可达依赖，违反约束返回 409 并列出完整链路，"
         "不写入部分变更。"
+        "另提供会议室批量分配（meeting rooms）：房间按 room_id upsert"
+        "（容量 + 去重设备标签）；提交一组 active 预约及各自所需容量、"
+        "设备后结合既有分配与预约时段全局求解（同一房间不得分给时间重叠的"
+        "预约），仅当整批有解时才在单个 BEGIN IMMEDIATE 事务内持久化，"
+        "无解返回 409 并列出无法分配的预约且不改动已有分配；"
+        "结果确定：优先总空余座位最少，再按预约 id、room_id 字典序取解。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -253,6 +272,25 @@ async def chain_verification_error_handler(
     return JSONResponse(
         status_code=409,
         content={"detail": f"reservation history chain verification failed: {exc}"},
+    )
+
+
+@app.exception_handler(RoomNotFoundError)
+async def room_not_found_handler(request, exc: RoomNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(BatchAssignmentInfeasibleError)
+async def batch_assignment_infeasible_handler(
+    request, exc: BatchAssignmentInfeasibleError
+) -> JSONResponse:
+    # 整批无解：409 列出无法分配的预约（含需求与原因），已有分配保持原样
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "unassignable": exc.unassignable,
+        },
     )
 
 
@@ -711,3 +749,155 @@ def create_reservation_dependency(
         # 幂等重放：返回原依赖
         response.status_code = 200
     return _dependency_to_out(dependency)
+
+
+# ------------------------------------------------------------- meeting rooms
+
+
+def _room_to_out(room: room_core.Room) -> MeetingRoomOut:
+    return MeetingRoomOut(
+        room_id=room.room_id,
+        capacity=room.capacity,
+        equipment_tags=list(room.equipment),
+        created_at=_iso_z(room.created_at),
+        updated_at=_iso_z(room.updated_at),
+    )
+
+
+@app.put("/api/v1/meeting-rooms/{room_id}", response_model=MeetingRoomOut)
+def upsert_meeting_room(room_id: str, req: MeetingRoomIn,
+                        response: Response) -> MeetingRoomOut:
+    """会议室 upsert：按路径 ``room_id`` 创建或更新房间。
+
+    - 路径 ``room_id`` 与请求体 ``room_id`` 不一致 → ``422``；
+    - ``room_id`` 不存在 → ``201`` 新建（容量 + 去重字典序设备标签）；
+    - ``room_id`` 已存在 → ``200`` 更新容量与设备标签（``created_at``
+      保留，``updated_at`` 推进）；**不会**改动任何既有分配。
+
+    整个 upsert 在单个 ``BEGIN IMMEDIATE`` 事务内完成。
+    """
+    if req.room_id != room_id:
+        raise HTTPException(
+            status_code=422,
+            detail=("room_id in request body must match the room_id in the path: "
+                    f"{req.room_id!r} != {room_id!r}"),
+        )
+    room, created = room_core.upsert_room(
+        room_id=room_id,
+        capacity=req.capacity,
+        equipment_tags=req.equipment_tags,
+    )
+    if created:
+        response.status_code = 201
+    return _room_to_out(room)
+
+
+@app.get(
+    "/api/v1/meeting-rooms/{room_id}",
+    response_model=MeetingRoomOut,
+)
+def get_meeting_room(room_id: str) -> MeetingRoomOut:
+    """查询单个会议室（含容量与去重设备标签）；不存在 → ``404``。"""
+    return _room_to_out(room_core.get_room(room_id))
+
+
+@app.get("/api/v1/meeting-rooms", response_model=MeetingRoomListOut)
+def list_meeting_rooms() -> MeetingRoomListOut:
+    """列出全部会议室，按 ``room_id`` 字典序升序。"""
+    return MeetingRoomListOut(
+        rooms=[_room_to_out(room) for room in room_core.list_rooms()])
+
+
+@app.post(
+    "/api/v1/meeting-room-assignments/batch",
+    response_model=RoomBatchAssignmentOut,
+)
+def batch_assign_meeting_rooms(req: RoomBatchAssignmentIn) -> RoomBatchAssignmentOut:
+    """会议室批量分配：一组 active 预约的全局确定性房间分配。
+
+    结合**已有分配**（本批未涉及的预约视为固定占用）与各预约时段做全局求解：
+
+    - 房间容量须满足 ``required_capacity``，且房间设备标签须包含全部
+      ``required_equipment``；
+    - 同一房间不得分给时间半开区间 ``[start, end)`` 重叠的两条预约
+      （首尾相接可同房）；本批预约之间同样不得在同房时间重叠；
+    - 结果确定：在全部可行解中优先**总空余座位最少**
+      （sum(room.capacity - required_capacity)），并列时取按预约 id 升序、
+      room_id 字典序的完整分配向量字典序最小解；
+    - 仅整批有解时才在**单个 ``BEGIN IMMEDIATE`` 事务**内持久化（本批预约
+      的旧分配被原子替换，本批之外的分配不触碰）；
+    - 无解 → ``409``，``unassignable`` 按预约 id 升序列出无法分配的预约
+      （含所需容量/设备与原因），事务整体回滚，**不改动任何已有分配**；
+    - 任一预约不存在 → ``404``；批次内 ``reservation_id`` 重复、
+      需求非法（容量 < 1、空标签）→ ``422``。
+    """
+    result = room_core.batch_assign_rooms(
+        (item.reservation_id, item.required_capacity, item.required_equipment)
+        for item in req.reservations
+    )
+    assignment: dict[int, str] = result["assignments"]
+    windows: dict[int, tuple] = result["windows"]
+    rooms: dict[str, room_core.Room] = result["rooms"]
+    req_by_id = {item.reservation_id: item for item in req.reservations}
+    items: list[RoomAssignmentOut] = []
+    for reservation_id in sorted(assignment):
+        item = req_by_id[reservation_id]
+        room_id = assignment[reservation_id]
+        start_s, end_s = windows[reservation_id]
+        items.append(RoomAssignmentOut(
+            reservation_id=reservation_id,
+            room_id=room_id,
+            required_capacity=item.required_capacity,
+            required_equipment=sorted(set(item.required_equipment)),
+            start_utc=_canon_z(start_s),
+            end_utc=_canon_z(end_s),
+            spare_seats=rooms[room_id].capacity - item.required_capacity,
+        ))
+    return RoomBatchAssignmentOut(
+        assignments=items,
+        total_spare_seats=result["total_spare_seats"],
+    )
+
+
+@app.get(
+    "/api/v1/meeting-room-assignments",
+    response_model=RoomAssignmentListOut,
+)
+def list_meeting_room_assignments(
+    reservation_id: int | None = Query(
+        default=None, ge=1,
+        description="按预约 ID 精确过滤；预约不存在 → 404",
+    ),
+    room_id: str | None = Query(
+        default=None,
+        description="按房间 ID 精确过滤；房间不存在 → 404",
+    ),
+    active_only: bool = Query(
+        default=False,
+        description="仅返回 active 预约的分配；默认连已取消预约的历史分配一起返回",
+    ),
+) -> RoomAssignmentListOut:
+    """查询会议室分配，默认返回全部，按 ``reservation_id`` 升序。
+
+    可组合 ``reservation_id`` / ``room_id`` 精确过滤；已取消预约的历史分配
+    默认仍返回（``status`` 标明状态），``active_only=true`` 可只看进行中。
+    """
+    views = room_core.list_assignments(
+        reservation_id=reservation_id,
+        room_id=room_id,
+        active_only=active_only,
+    )
+    return RoomAssignmentListOut(assignments=[
+        RoomAssignmentQueryOut(
+            assignment_id=view.id,
+            reservation_id=view.reservation_id,
+            room_id=view.room_id,
+            start_utc=_iso_z(view.start_utc),
+            end_utc=_iso_z(view.end_utc),
+            status=view.status,
+            room_capacity=view.room_capacity,
+            room_equipment_tags=list(view.room_equipment),
+            assigned_at=_iso_z(view.created_at),
+        )
+        for view in views
+    ])

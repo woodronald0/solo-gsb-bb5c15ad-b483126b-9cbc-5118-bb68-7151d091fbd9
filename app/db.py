@@ -111,6 +111,23 @@ CREATE INDEX IF NOT EXISTS idx_dependencies_predecessor
     ON reservation_dependencies (predecessor_id);
 CREATE INDEX IF NOT EXISTS idx_dependencies_successor
     ON reservation_dependencies (successor_id);
+CREATE TABLE IF NOT EXISTS meeting_rooms (
+    room_id       TEXT PRIMARY KEY,          -- 会议室唯一标识（客户端提供）
+    capacity      INTEGER NOT NULL,          -- 容量（座位数，>=1）
+    equipment_key TEXT NOT NULL,             -- 去重排序后的设备标签 JSON
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL              -- upsert 更新时刻；首次创建与 created_at 相同
+);
+CREATE TABLE IF NOT EXISTS meeting_room_assignments (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id INTEGER NOT NULL UNIQUE
+        REFERENCES reservations(id) ON DELETE CASCADE,  -- 一条预约至多分到一间房
+    room_id        TEXT NOT NULL REFERENCES meeting_rooms(room_id),
+    created_at     TEXT NOT NULL
+);
+-- 批量求解/分配查询按房间取既有占用；reservation_id 由 UNIQUE 约束自带索引
+CREATE INDEX IF NOT EXISTS idx_mra_room
+    ON meeting_room_assignments (room_id);
 """
 
 _init_lock = threading.Lock()
@@ -157,6 +174,8 @@ def init_db(db_path: str | None = None) -> None:
       预约/事件数据，建表幂等可重复执行。
     - ``reservation_dependencies``（预约时序依赖表）同样以
       ``CREATE TABLE IF NOT EXISTS`` 幂等无损建立，不影响任何既有数据。
+    - ``meeting_rooms`` / ``meeting_room_assignments``（会议室与批量分配表）
+      同样以 ``CREATE TABLE IF NOT EXISTS`` 幂等无损建立，不影响任何既有数据。
     """
     path = db_path or get_db_path()
     with _init_lock:
